@@ -1,0 +1,7 @@
+streamlit==1.37.0
+pypdf==4.2.0
+sentence-transformers==2.7.0
+chromadb==0.5.3
+rank-bm25==0.2.2
+numpy==1.26.4
+pandas==2.2.2
