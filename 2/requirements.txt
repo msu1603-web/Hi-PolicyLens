@@ -1,5 +1,5 @@
 streamlit
-PyMuPDF
+pypdf
 sentence-transformers
-chromadb==0.4.22
-pysqlite3-binary
+chromadb
+requests
