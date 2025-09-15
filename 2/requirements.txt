@@ -1,0 +1,5 @@
+streamlit
+PyMuPDF
+sentence-transformers
+chromadb==0.4.22
+pysqlite3-binary
