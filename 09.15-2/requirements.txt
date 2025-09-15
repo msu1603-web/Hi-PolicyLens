@@ -1,0 +1,6 @@
+streamlit==1.37.0
+pymupdf==1.24.9         # PDF 텍스트/페이지 추출
+sentence-transformers==3.0.1
+chromadb==0.5.5
+numpy==1.26.4
+requests==2.32.3
