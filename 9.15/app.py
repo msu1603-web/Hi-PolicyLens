@@ -1,129 +1,98 @@
+# app.py
 import os
-import io
-import time
-import urllib.request
-import tempfile
-import pandas as pd
-import numpy as np
 import streamlit as st
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.utils import embedding_functions
-from utils import extract_pdf_text_with_pages, build_chunks, extract_verbatim_quotes, dedupe_preserve_order
+import tempfile
+from rag import extract_pages, chunk_text, VectorStore, build_extract_only_answer
+import requests
 
-st.set_page_config(page_title="PDF 원문 발췌 QA", page_icon="📑", layout="wide")
+st.set_page_config(page_title="PDF 발췌 RAG", layout="wide")
 
-DB_DIR = "db"
-os.makedirs("data", exist_ok=True)
-os.makedirs(DB_DIR, exist_ok=True)
+st.title("📄 PDF 질의·응답 (원문 '그대로 발췌' 전용)")
 
-# -------- Sidebar: 업로드/색인 --------
-st.sidebar.header("① 문서 업로드 & 색인")
-uploaded = st.sidebar.file_uploader("PDF 업로드(.pdf)", type=["pdf"], accept_multiple_files=True)
-url_input = st.sidebar.text_input("PDF URL 붙여넣기(선택)")
+# --- 사이드바: 인덱싱 ---
+with st.sidebar:
+    st.header("① PDF 업로드 & 인덱싱")
+    uploaded = st.file_uploader("PDF 파일 업로드", type=["pdf"])
+    build_index = st.button("인덱스 생성/초기화")
 
-if "embed_model" not in st.session_state:
-    st.session_state.embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-if "chroma" not in st.session_state:
-    st.session_state.client = chromadb.PersistentClient(path=DB_DIR)
-    st.session_state.collection = st.session_state.client.get_or_create_collection(
-        name="pdf_quotes",
-        embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-    )
+    st.divider()
+    st.header("② (선택) 포텐스 API")
+    use_potens = st.checkbox("포텐스 API로 발췌문 형식화(요약 금지)", value=False)
+    pot_endpoint = "https://ai.potens.ai/api/chat"
+    pot_key = st.secrets.get("POTENS_API_KEY", None)
+    if use_potens and not pot_key:
+        st.warning("⚠️ Streamlit Secrets에 POTENS_API_KEY 를 넣어주세요.")
 
-def index_pdf(path: str, doc_id_prefix: str):
-    pages = extract_pdf_text_with_pages(path)
-    chunks = build_chunks(pages, window_sentences=6, stride=3)
-    if not chunks:
-        return 0
+# --- 전역: 벡터 스토어 준비 ---
+VS_DIR = "chroma_store"
+vs = VectorStore(persist_dir=VS_DIR)
 
-    # Chroma에 저장
-    ids = []
-    docs = []
-    metas = []
-    for i, ch in enumerate(chunks):
-        ids.append(f"{doc_id_prefix}-{i}")
-        docs.append(ch["text"])
-        metas.append({"page": ch["page"], "source": os.path.basename(path)})
+# 인덱싱 단계
+if uploaded and build_index:
+    vs.reset()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded.read())
+        tmp_path = tmp.name
 
-    st.session_state.collection.add(ids=ids, documents=docs, metadatas=metas)
-    return len(chunks)
+    with st.status("PDF에서 텍스트 추출 중...", expanded=False):
+        pages = extract_pages(tmp_path)
 
-colL, colR = st.columns(2)
-with colL:
-    if uploaded:
-        for f in uploaded:
-            save_path = os.path.join("data", f.name)
-            with open(save_path, "wb") as out:
-                out.write(f.read())
-            n = index_pdf(save_path, doc_id_prefix=f.name)
-            st.success(f"{f.name} 색인 완료: {n}개 청크")
-with colR:
-    if url_input:
-        try:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            urllib.request.urlretrieve(url_input, tmp.name)
-            name = url_input.split("/")[-1].split("?")[0] or f"url_{int(time.time())}.pdf"
-            save_path = os.path.join("data", name)
-            os.replace(tmp.name, save_path)
-            n = index_pdf(save_path, doc_id_prefix=name)
-            st.success(f"URL 문서 색인 완료: {name} / {n}개 청크")
-        except Exception as e:
-            st.error(f"URL 다운로드 실패: {e}")
+    with st.status("청크 분할 및 임베딩 중...", expanded=False):
+        chunks = chunk_text(pages, max_chars=1200, overlap=200)
+        vs.add_chunks(pdf_id=os.path.basename(tmp_path), chunks=chunks)
 
-st.sidebar.divider()
-st.sidebar.caption("※ 스캔(이미지) PDF는 텍스트 추출이 어려울 수 있습니다(초기 버전은 OCR 미지원).")
+    st.success(f"인덱스 완료! 총 {len(chunks)}개 청크를 추가했습니다.")
+    os.remove(tmp_path)
 
-# -------- Main: 질문 → 원문 발췌 --------
-st.header("📑 PDF 원문 발췌 QA (요약/창작 금지)")
-query = st.text_input("질문을 입력하세요 (예: 올해 태양광 투자 계획은 어떻게 돼?)")
-top_k = st.number_input("검색 청크 개수 (k)", min_value=3, max_value=50, value=10)
+# --- 메인: 질의/발췌 ---
+st.header("질문하기")
+q = st.text_input("예) 올해 태양광 투자 계획은 어떻게 돼?")
+k = st.slider("검색할 청크 개수 (k)", 3, 15, 8)
 
-def search_and_quote(question: str, k: int = 10, max_quotes: int = 8):
-    if st.session_state.collection.count() == 0:
-        return [], []
-    # 1) 벡터 검색
-    out = st.session_state.collection.query(query_texts=[question], n_results=k)
-    docs = out.get("documents", [[]])[0]
-    metas = out.get("metadatas", [[]])[0]
-
-    # 2) 각 청크에서 '문장 단위'로 정확 인용 추출
-    quotes = []
-    rows = []
-    for doc, meta in zip(docs, metas):
-        qts = extract_verbatim_quotes(doc, question, topk=3)
-        for q in qts:
-            quotes.append(q)
-            rows.append({
-                "인용문": q,
-                "페이지": meta.get("page"),
-                "문서": meta.get("source")
-            })
-            if len(quotes) >= max_quotes:
-                break
-        if len(quotes) >= max_quotes:
-            break
-
-    # 3) 중복 제거 & 결과 표
-    dq = dedupe_preserve_order(quotes)
-    df = pd.DataFrame(rows)
-    return dq, df
-
-if st.button("🔎 원문 발췌 찾기", type="primary"):
-    if not query.strip():
+if st.button("검색 실행"):
+    if not q.strip():
         st.warning("질문을 입력하세요.")
     else:
-        quotes, table = search_and_quote(query, k=int(top_k))
-        if not quotes:
-            st.error("관련 정보를 찾을 수 없음 (문서에 해당 내용이 없거나, 스캔 PDF로 텍스트가 추출되지 않았을 수 있습니다).")
-        else:
-            st.success(f"원문 인용 {len(quotes)}건")
-            for i, q in enumerate(quotes, start=1):
-                st.markdown(f"**{i}.** “{q}”")
-            st.dataframe(table, use_container_width=True)
-            csv = table.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("⬇️ CSV로 내보내기", data=csv, file_name="quotes.csv", mime="text/csv")
+        hits = vs.query(q, k=k)
+        answer = build_extract_only_answer(hits)
 
-st.caption("※ 본 도구는 원문 ‘그대로’ 인용만 제공합니다. 문서에 없으면 ‘관련 정보를 찾을 수 없음’으로 표시됩니다.")
+        # 화면에 원문 발췌 바로 보여주기
+        st.subheader("🔎 원문 발췌 결과")
+        if answer == "관련 정보를 찾을 수 없음":
+            st.info(answer)
+        else:
+            st.code(answer, language="markdown")
+
+        # (선택) 포텐스 API로 "발췌만" 형식화
+        if use_potens and pot_key:
+            st.subheader("🛠 포텐스 API 형식화(요약 금지)")
+            prompt = f"""당신은 편집 보조자입니다.
+아래 '검색 발췌' 텍스트만 사용해 질문에 답하세요. 
+규칙:
+- 원문 문장만 그대로 복사해서 사용하고, 임의 요약/의역 금지
+- 인용 문장 앞에 반드시 페이지 표기 [p.xx]를 유지
+- 문서에 없으면 '관련 정보를 찾을 수 없음'이라고만 답변
+
+[질문]
+{q}
+
+[검색 발췌]
+{answer}
+"""
+            try:
+                res = requests.post(
+                    pot_endpoint,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {st.secrets['POTENS_API_KEY']}"
+                    },
+                    json={"prompt": prompt},
+                    timeout=60
+                )
+                res.raise_for_status()
+                out = res.json()
+                # API 응답 포맷에 맞게 수정 필요할 수 있음 (샘플)
+                llm_text = out.get("text") or out.get("response") or str(out)
+                st.code(llm_text, language="markdown")
+            except Exception as e:
+                st.error(f"포텐스 API 호출 실패: {e}")
